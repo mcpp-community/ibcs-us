@@ -43,7 +43,10 @@ jobs:
           version="${GITHUB_REF_NAME}"
           case "$GITHUB_REF" in refs/tags/*) ;; *) version="0-untagged" ;; esac
           mkdir dist
-          tar czf "dist/ibcs-us-${version}-linux-x64.tar.gz" -C "$RUNNER_TEMP/out" .
+          # One top-level directory, named after the archive.
+          name="ibcs-us-${version}-linux-x64"
+          mkdir "$RUNNER_TEMP/pack" && cp -R "$RUNNER_TEMP/out" "$RUNNER_TEMP/pack/$name"
+          tar czf "dist/$name.tar.gz" -C "$RUNNER_TEMP/pack" "$name"
           cp upstream/ibcs-us-*.tar.gz dist/
           (cd dist && for f in *; do sha256sum "$f" > "$f.sha256"; cat "$f.sha256"; done)
       - uses: actions/upload-artifact@v4
