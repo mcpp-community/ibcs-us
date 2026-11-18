@@ -12,8 +12,9 @@
 # The recipe needs a GCC that compiles for i386 and nothing of an i386 system:
 # the program is free-standing (`-nostdlib'), so the two things it takes from a
 # 32-bit development package are supplied here --- the empty `gnu/stubs-32.h'
-# the host's <features.h> asks for, and the one routine of libgcc the objects
-# refer to (build/pc-thunk.S).
+# the host's <features.h> asks for, the host's own header directory for the
+# processor family, and the one routine of libgcc the objects refer to
+# (build/pc-thunk.S).
 #
 # `-O1': at the source's `-O2', GCC 16 produced a loader that failed in open().
 # `-std=gnu17': the source defines `bool'. `-fno-strict-aliasing': the source
@@ -34,10 +35,16 @@ src="$work/ibcs-us-$UPSTREAM"
 for p in "$here"/patches/*.patch; do patch -d "$src" -p1 --no-backup-if-mismatch < "$p"; done
 
 mkdir -p "$work/stub32/gnu"; : > "$work/stub32/gnu/stubs-32.h"
+# A multi-architecture host keeps <asm/...> and <bits/...> beneath the compiler's
+# own architecture, where a compilation for i386 does not look. The headers are
+# the processor family's and serve both, so that directory is searched last.
+multiarch="$("${CC:-gcc}" -print-multiarch 2>/dev/null || true)"
+after=""
+if [ -n "$multiarch" ] && [ -d "/usr/include/$multiarch" ]; then after="-idirafter /usr/include/$multiarch"; fi
 "${CC:-gcc}" -m32 -c -o "$work/pc-thunk.o" "$here/build/pc-thunk.S"
 make -C "$src" -j"$(nproc)" CC="${CC:-gcc}" \
   CFLAGS_OPT="-O1 -fno-builtin -ffreestanding -fno-strict-aliasing" \
-  CFLAGS_EXTRA="-I$work/stub32 -std=gnu17" CFLAGS_ERROR="" \
+  CFLAGS_EXTRA="-I$work/stub32 $after -std=gnu17" CFLAGS_ERROR="" \
   LDFLAGS_LIBS="-nostdlib $work/pc-thunk.o"
 
 mkdir -p "$out/bin" "$out/share/ibcs-us/patches"
