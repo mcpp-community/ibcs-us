@@ -1,0 +1,57 @@
+name: Build
+
+# What this workflow asserts.
+#
+#   build   the upstream release (upstream/), held to its digest, builds with patches/ by build.sh on the
+#           runner's own GCC, with no i386 development package installed.
+#   probe   tests/run.sh: a program of the interface with no C library, under the three
+#           interfaces a static ELF is run as; each line is one of the corrections.
+#   release on a tag `<upstream>-<n>', the same steps' output is the release: the archive the
+#           xlings package installs, its digest, and the upstream source archive beside it.
+#           A release is not built by other steps than the ones that were tested.
+
+on:
+  push:
+    branches: [main]
+    tags: ['[0-9]+.[0-9]+-[0-9]+']
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: write   # the tag path attaches the archives to the release
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build
+        run: |
+          gcc --version | head -1
+          ./build.sh "$RUNNER_TEMP/work" "$RUNNER_TEMP/out"
+          file "$RUNNER_TEMP/out/bin/ibcs-us"
+      - name: The host lets an unprivileged user make a user namespace
+        run: |
+          if ! unshare -Ur true 2>/dev/null; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+          unshare -Ur true
+      - name: Probe
+        run: ./tests/run.sh "$RUNNER_TEMP/out/bin/ibcs-us" "$RUNNER_TEMP/probe"
+      - name: Archive
+        run: |
+          version="${GITHUB_REF_NAME}"
+          case "$GITHUB_REF" in refs/tags/*) ;; *) version="0-untagged" ;; esac
+          mkdir dist
+          tar czf "dist/ibcs-us-${version}-linux-x64.tar.gz" -C "$RUNNER_TEMP/out" .
+          cp upstream/ibcs-us-*.tar.gz dist/
+          (cd dist && for f in *; do sha256sum "$f" > "$f.sha256"; cat "$f.sha256"; done)
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ibcs-us
+          path: dist/
+      - name: Publish to the release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*

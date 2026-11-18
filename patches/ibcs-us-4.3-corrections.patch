@@ -1,0 +1,255 @@
+--- a/binfmt-elf/binfmt_elf.c
++++ b/binfmt-elf/binfmt_elf.c
+@@ -171,18 +171,29 @@
+ 	addr = ELF_PAGESTART(addr);
+ 	size = ELF_PAGEALIGN(size);
+ 	memsize = ELF_PAGEALIGN(memsize);
+-	/* Extend the mapping over the BSS region so do_brk() in this
+-	 * codebase doesn't have to allocate it (it can't - see do_brk()). */
+-	if (size < memsize)
+-		size = memsize;
++	/* The pages of the segment beyond its file part (the BSS) are mapped
++	 * here, since do_brk() in this codebase cannot allocate them (see
++	 * do_brk()). They are anonymous pages: the file's mapping was extended
++	 * over them, and where the file ends before they do -- an executable
++	 * with no debugging information after its data -- touching one was a
++	 * SIGBUS. */
+ 
+ 	/* mmap() will return -EINVAL if given a zero size, but a
+ 	 * segment with zero filesize is perfectly valid */
+-	if (!size)
++	if (!size && !memsize)
+ 		return addr;
+ 
+ 	down_write(&current->mm->mmap_sem);
+-	map_addr = elf_mmap(filep, addr, size, prot, type, off);
++	map_addr = addr;
++	if (size)
++		map_addr = elf_mmap(filep, addr, size, prot, type, off);
++	if (!IBCS_IS_ERR(map_addr) && memsize > size) {
++		unsigned long bss_addr = elf_mmap(
++		    NULL, map_addr + size, memsize - size, prot,
++		    MAP_PRIVATE | MAP_FIXED | MAP_ANONYMOUS, 0);
++		if (IBCS_IS_ERR(bss_addr))
++			map_addr = bss_addr;
++	}
+ 
+ 	up_write(&current->mm->mmap_sem);
+ 	return(map_addr);
+--- a/ibcs/linux26-compat.c
++++ b/ibcs/linux26-compat.c
+@@ -282,9 +282,20 @@
+ }
+ 
+ 
++/*
++ * The position is sixty-four bits and the call takes its arguments as words:
++ * handed to lseek as it stood, its upper half was read as the origin, so a
++ * query of the position (an offset of zero from the current one) set the
++ * position to zero. A directory was then listed from its beginning at every
++ * call. _llseek takes the two halves and answers a sixty-four bit position.
++ */
+ loff_t file_operations_llseek(struct file* file, loff_t loff, int origin)
+ {
+-    return (loff_t)IBCS_SYSCALL(lseek, file->fd, loff, origin);
++    loff_t	result = 0;
++    int		retval = IBCS_SYSCALL(
++	_llseek, file->fd, (unsigned long)((u64)loff >> 32), (unsigned long)loff,
++	&result, origin);
++    return IBCS_IS_ERR(retval) ? (loff_t)retval : result;
+ }
+ 
+ 
+@@ -667,31 +678,69 @@
+  * the directory contents.  We emulate the same functions here using user
+  * space syscalls.
+  */
++/*
++ * A batch of the host's entries is read and each is handed to filldir. An entry
++ * filldir has no room for is read again by the next call: the directory is
++ * repositioned to the cookie of the entry before it (d_off), or to where the
++ * batch began. The positions are the host's cookies, which a file system may
++ * make sixty-four bits wide, so they are taken and set by _llseek.
++ *
++ * It read a batch and handed over its first entry only, so a directory was
++ * listed as one entry, again at every call.
++ */
++static int vfs_readdir_seek(int fd, loff_t to, int whence, loff_t* at)
++{
++    loff_t	result = 0;
++    int		retval = IBCS_SYSCALL(
++	_llseek, fd, (unsigned long)((u64)to >> 32), (unsigned long)to,
++	&result, whence);
++    if (!IBCS_IS_ERR(retval) && at != (loff_t*)0) {
++	*at = result;
++    }
++    return retval;
++}
++
++
+ int vfs_readdir(struct file* file, filldir_t filldir, void* dirent)
+ {
+-    struct {
+-	struct linux_dirent64 dirent;
+-	char		name[PATH_MAX];
+-    }			buf;
++    char		buf[4096];
++    loff_t		resume = 0;
+     int			retval;
+ 
++    retval = vfs_readdir_seek(file->fd, 0, 1, &resume);
++    if (IBCS_IS_ERR(retval)) {
++	return retval;
++    }
+     for (;;) {
+-	retval = IBCS_SYSCALL(getdents64, file->fd, &buf.dirent, sizeof(buf));
+-	if (IBCS_IS_ERR(retval) || retval <= sizeof(buf.dirent)) {
+-	    break;
++	int		pos;
++	int		got = IBCS_SYSCALL(getdents64, file->fd, buf, sizeof(buf));
++	if (IBCS_IS_ERR(got) || got == 0) {
++	    return got;
+ 	}
++	for (pos = 0; pos < got;) {
++	    struct linux_dirent64* d = (struct linux_dirent64*)(buf + pos);
+ #pragma GCC diagnostic push
+ #pragma GCC diagnostic ignored "-Wstringop-overread"
+-	retval = (*filldir)(
+-	    dirent, buf.dirent.d_name, strlen(buf.dirent.d_name),
+-	    buf.dirent.d_off, buf.dirent.d_ino, buf.dirent.d_type
+-	);
++	    retval = (*filldir)(
++		dirent, d->d_name, strlen(d->d_name),
++		d->d_off, d->d_ino, d->d_type
++	    );
+ #pragma GCC diagnostic pop
+-	if (IBCS_IS_ERR(retval)) {
+-	    break;
++	    if (IBCS_IS_ERR(retval)) {
++		/*
++		 * The caller's buffer is full, which is how a listing in
++		 * parts proceeds and no failure of the reading: the answer is
++		 * zero, as the kernel's vfs_readdir gives, and what filldir
++		 * found is in its own record. Its status was returned, so a
++		 * directory larger than the caller's buffer was an error.
++		 */
++		vfs_readdir_seek(file->fd, resume, 0, (loff_t*)0);
++		return 0;
++	    }
++	    resume = d->d_off;
++	    pos += d->d_reclen;
+ 	}
+     }
+-    return retval;
+ }
+ 
+ 
+@@ -1815,8 +1864,13 @@
+     [__NR_execve] =	linux26_map_a1_fname,
+     [__NR_chdir] =	linux26_map_a1_fname,
+     [__NR_mknod] =	linux26_map_a1_fname,
+-    [__NR_chmod] =	linux26_stat,
+-    [__NR_chown] =	linux26_access,
++    /*
++     * chmod and chown take a path and words. They were entered as the stat
++     * and access handlers, which read their second argument as a buffer or
++     * take two arguments: chmod of any file answered EFAULT.
++     */
++    [__NR_chmod] =	linux26_map_a1_fname,
++    [__NR_chown] =	linux26_map_a1_fname,
+     [__NR_oldfstat] =	linux26_stat,
+     [__NR_dup] =	linux26_dup,
+     [__NR_brk] =	linux26_brk,
+--- a/per-svr4/fcntl.c
++++ b/per-svr4/fcntl.c
+@@ -141,8 +141,25 @@
+ 		/* Extend allocation for specified portion of file. */
+ 		return 0;
+ 	case 11: /* F_FREESP */
+-		/* Free a portion of a file. */
+-		return 0;
++	    {
++		/*
++		 * Free a portion of a file. From an offset to the end of
++		 * the file (l_len of zero) it is how these systems shorten
++		 * a file, and their C library's ftruncate() is this call:
++		 * it answered success and freed nothing, so a file a
++		 * program had shortened kept its length. A portion within
++		 * the file is still accepted and not freed.
++		 */
++		struct svr4_flock fl;
++
++		if (copy_from_user(&fl, (void __user *)arg, sizeof(fl)))
++			return -EFAULT;
++		if (fl.l_len != 0)
++			return 0;
++		if (fl.l_whence != 0)
++			return -EINVAL;
++		rval = SYS(ftruncate,fd, fl.l_start); return rval;
++	    }
+ 
+ 	/*
+ 	 * These are intended to support the Xenix chsize() and
+--- a/per-svr4/open.c
++++ b/per-svr4/open.c
+@@ -263,9 +263,22 @@
+ #define NAME_OFFSET(de)	((int) ((de)->d_name - (char *) (de)))
+ #define ROUND_UP(x)	(((x)+sizeof(long)-1) & ~(sizeof(long)-1))
+ 
++/*
++ * The entry as these systems write it: the inode and the offset in a long
++ * each, the record's length, the name. It was the build host's `struct
++ * dirent', which on a host of large files is the sixty-four bit layout, and
++ * a program read its names nine bytes late.
++ */
++struct svr4_dirent {
++	u32		d_ino;
++	s32		d_off;
++	unsigned short	d_reclen;
++	char		d_name[1];
++};
++
+ struct svr4_getdents_callback {
+-	struct dirent * current_dir;
+-	struct dirent * previous;
++	struct svr4_dirent * current_dir;
++	struct svr4_dirent * previous;
+ 	int count;
+ 	int error;
+ };
+@@ -273,7 +286,7 @@
+ static int svr4_filldir(void * __buf, const char * name, int namlen,
+ 	loff_t offset, u64 ino, unsigned int d_type)
+ {
+-	struct dirent * dirent;
++	struct svr4_dirent * dirent;
+ 	struct svr4_getdents_callback * buf = (struct svr4_getdents_callback *) __buf;
+ 	int reclen = ROUND_UP(NAME_OFFSET(dirent) + namlen + 1);
+ 
+@@ -319,7 +332,7 @@
+ 	put_user(0, name_end);
+ 	{	char *ptr = (char *)dirent;
+ 		ptr += reclen;
+-		dirent = (struct dirent *)ptr;
++		dirent = (struct svr4_dirent *)ptr;
+ 	}
+ 	buf->current_dir = dirent;
+ 	buf->count -= reclen;
+@@ -331,7 +344,7 @@
+ int svr4_getdents(int fd, char *dirent, int count)
+ {
+ 	struct file * file;
+-	struct dirent * lastdirent;
++	struct svr4_dirent * lastdirent;
+ 	struct svr4_getdents_callback buf;
+ 	int error;
+ 
+@@ -340,7 +353,7 @@
+ 	if (!file)
+ 		goto out;
+ 
+-	buf.current_dir = (struct dirent *) dirent;
++	buf.current_dir = (struct svr4_dirent *) dirent;
+ 	buf.previous = NULL;
+ 	buf.count = count;
+ 	buf.error = 0;
