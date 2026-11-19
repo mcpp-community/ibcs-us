@@ -1,0 +1,316 @@
+diff -ruN a/ibcs/main.c b/ibcs/main.c
+--- a/ibcs/main.c	2026-07-23 19:30:21.000000000 +0900
++++ b/ibcs/main.c	2026-11-19 15:46:31.277101536 +0900
+@@ -47,6 +47,7 @@
+     const char*		argv0;
+     const char*		me;
+     const char* const*	ibcs_argv;
++    const char*		exec_path;
+     u_long		personality;
+     unsigned		abi_trage_flg;
+     int			abi_trace_fd;
+@@ -55,6 +56,75 @@
+ 
+ 
+ /*
++ * THE OPTIONS A PROGRAM WAS STARTED WITH, KEPT FOR THE PROGRAMS IT STARTS BY
++ * exec.  A program of the interface that replaces its image with another such
++ * program is started again under this emulation (abi_exec), and the new one is
++ * run as this one was: under the personality, the trace flags, the log and the
++ * file map the command line gave.  They are copied here, because the command
++ * line's strings are the emulated program's to overwrite.
++ */
++static char	exec_opt_argv0[256] = "ibcs-us";
++static char	exec_opt_personality[24];
++static char	exec_opt_trace[24];
++static char	exec_opt_log[24];
++static char*	exec_opt_map;
++
++static void keep_exec_options(const struct cmdline_options* o)
++{
++    if (strlen(o->argv0) < sizeof(exec_opt_argv0)) {
++	strcpy(exec_opt_argv0, o->argv0);
++    }
++    if (o->personality != 0) {
++	ibcs_fmt(exec_opt_personality, sizeof(exec_opt_personality), "%lx", o->personality);
++    }
++    if (o->abi_trage_flg != 0) {
++	ibcs_fmt(exec_opt_trace, sizeof(exec_opt_trace), "%x", o->abi_trage_flg);
++    }
++    if (o->abi_trace_fd != 2) {
++	ibcs_fmt(exec_opt_log, sizeof(exec_opt_log), "%d", o->abi_trace_fd);
++    }
++    if (o->filemap_filename != (const char*)0) {
++	exec_opt_map = ibcs_malloc(strlen(o->filemap_filename) + 1);
++	if (exec_opt_map != (char*)0) {
++	    strcpy(exec_opt_map, o->filemap_filename);
++	}
++    }
++}
++
++/*
++ * The head of the command line that starts a program as this one was started:
++ * this program's name, then its options.  `room' must be at least nine.
++ * Returns the number of strings written.
++ */
++int ibcs_exec_options(const char** out, int room)
++{
++    int		n = 0;
++
++    if (room < 9) {
++	return 0;
++    }
++    out[n++] = exec_opt_argv0;
++    if (exec_opt_personality[0] != '\0') {
++	out[n++] = "-p";
++	out[n++] = exec_opt_personality;
++    }
++    if (exec_opt_trace[0] != '\0') {
++	out[n++] = "-t";
++	out[n++] = exec_opt_trace;
++    }
++    if (exec_opt_log[0] != '\0') {
++	out[n++] = "-l";
++	out[n++] = exec_opt_log;
++    }
++    if (exec_opt_map != (char*)0) {
++	out[n++] = "-m";
++	out[n++] = exec_opt_map;
++    }
++    return n;
++}
++
++
++/*
+  * Print a usage message and exit.
+  */
+ static void usage(const char* me, const char* fmt, ...)
+@@ -69,6 +139,7 @@
+     } else {
+ 	ibcs_writef(2, "usage: %s [options] ibcs-executable [arg..]\n", me);
+ 	ibcs_writef(2, "options:\n");
++        ibcs_writef(2, "  -e F, --exec=F       Load file F; the arguments are the program's, its first included.\n");
+         ibcs_writef(2, "  -h,   --help         Print this message & exit.\n");
+         ibcs_writef(2, "  -l L, --log=L        Where to write printk output, like trace.\n");
+         ibcs_writef(2, "  -m M, --map=M        Rewrite filenames using map file M.\n");
+@@ -350,6 +421,7 @@
+  * Command line options we recognise.
+  */
+ static const char* options[] = {
++    "-e=",	"--exec=",
+     "-l=",	"--log=",
+     "-h",	"--help",
+     "-m=",	"--map=",
+@@ -392,6 +464,9 @@
+ 		}
+ 	    }
+ 	}
++	if (!strcmp(option, "-e=") || !strcmp(option, "--exec=")) {
++	    cmdline_options->exec_path = arg;
++	}
+ 	if (!strcmp(option, "-h=") || !strcmp(option, "--help=")) {
+ 	    usage(cmdline_options->me, (char*)0);
+ 	}
+@@ -519,6 +594,19 @@
+     int			ibcs_filename_len = strlen(ibcs_filename);
+ 
+     /*
++     * --exec names the file, and the arguments that follow are the program's
++     * own, its first included: the form an exec of the emulated program is
++     * started in (abi_exec).  The file is named as exec(2) names it, so no
++     * PATH is searched.
++     */
++    if (cmdline_options->exec_path != (const char*)0) {
++	int err = load_binfmt(cmdline_options->exec_path);
++	if (!IBCS_IS_ERR(err)) {
++	    set_credentials(cmdline_options, cmdline_options->exec_path);
++	}
++	return err;
++    }
++    /*
+      * Go down the PATH environment variable looking for the program.
+      */
+     if (strchr(ibcs_filename, '/') != (char*)0) {
+@@ -597,6 +685,7 @@
+     const char*		ibcs_program_name;
+ 
+     parse_cmdline_options(&cmdline_options, argv);
++    keep_exec_options(&cmdline_options);
+     ibcs_program_name = strrchr(*cmdline_options.ibcs_argv, '/');
+     if (ibcs_program_name != (const char*)0) {
+ 	ibcs_program_name += 1;
+diff -ruN a/include/ibcs-us/ibcs/ibcs-lib.h b/include/ibcs-us/ibcs/ibcs-lib.h
+--- a/include/ibcs-us/ibcs/ibcs-lib.h	2026-07-23 19:30:21.000000000 +0900
++++ b/include/ibcs-us/ibcs/ibcs-lib.h	2026-11-19 15:46:31.277101536 +0900
+@@ -22,6 +22,7 @@
+ extern unsigned long	abi_personality(const char *);
+ extern _Noreturn void	ibcs_fatal(const char* message, ...);
+ extern _Noreturn void	ibcs_fatal_syscall(int retval, const char* message, ...);
++extern int		ibcs_exec_options(const char** out, int room);
+ extern int		ibcs_fmt(char* out, size_t size, const char* fmt, ...);
+ extern void		ibcs_free(void* blk);
+ extern void*		ibcs_malloc(size_t size);
+diff -ruN a/per-svr4/misc.c b/per-svr4/misc.c
+--- a/per-svr4/misc.c	2026-07-23 19:30:21.000000000 +0900
++++ b/per-svr4/misc.c	2026-11-19 15:48:19.248752450 +0900
+@@ -12,6 +12,8 @@
+ #include <ibcs-us/per-svr4/types.h>
+ #include <ibcs-us/per-svr4/y2k.h>
+ 
++#include <ibcs-us/ibcs/filemap.h>
++#include <ibcs-us/ibcs/ibcs-lib.h>
+ #include <ibcs-us/ibcs/linux26-compat.h>
+ #include <ibcs-us/linux26-compat/asm/uaccess.h>
+ #include <ibcs-us/linux26-compat/linux/cred.h>
+@@ -332,6 +334,125 @@
+ }
+ 
+ #if defined(CONFIG_ABI_TRACE)
++#ifdef	_KSL_IBCS_US
++/*
++ * AN exec OF A PROGRAM OF THE INTERFACE STAYS IN THE EMULATION.
++ *
++ * Handed to Linux as it is, exec starts the file as Linux's own program,
++ * outside this emulation, and the program's first call through the gate
++ * faults: a program that starts another of its kind (a shell, a command
++ * interpreter, a test that starts itself) could not.  So a file this emulation
++ * runs is started under it again: this program (/proc/self/exe) with the
++ * options this run was given and the file named by --exec, its arguments
++ * passed on unchanged.  A file it does not run is Linux's, as before: a
++ * script, a program of another architecture, an i386 program that names
++ * Linux's dynamic linker.
++ */
++/*
++ * ibcs_syscall is declared to return a long long, and only its low word is the
++ * system call's: the results are taken as int, as the rest of the program does.
++ */
++static int abi_exec_reads(int fd, u_long at, void* buf, int len)
++{
++	if (IBCS_IS_ERR((int)IBCS_SYSCALL(lseek, fd, at, 0)))
++		return 0;
++	return (int)IBCS_SYSCALL(read, fd, buf, len) == len;
++}
++
++static u_long abi_exec_word(const unsigned char* p, int bytes)
++{
++	u_long	v = 0;
++
++	while (bytes-- > 0)
++		v = (v << 8) | p[bytes];
++	return v;
++}
++
++/*
++ * Whether this emulation runs the file: an i386 COFF (0x14c) or x.out (0x206)
++ * executable, or a 32-bit little-endian i386 ELF whose interpreter, if it names
++ * one, is not Linux's.
++ */
++static int abi_exec_emulated(const char* path)
++{
++	unsigned char	eh[52], ph[32];
++	char		interp[64];
++	int		fd, emulated = 0;
++	u_long		i, phoff, phentsize, phnum;
++
++	fd = (int)IBCS_SYSCALL(open, path, O_RDONLY);
++	if (IBCS_IS_ERR(fd))
++		return 0;
++	if (!abi_exec_reads(fd, 0, eh, 2))
++		goto out;
++	if (abi_exec_word(eh, 2) == 0x14c || abi_exec_word(eh, 2) == 0x206) {
++		emulated = 1;
++		goto out;
++	}
++	if (!abi_exec_reads(fd, 0, eh, sizeof(eh)))
++		goto out;
++	if (eh[0] != 0x7f || eh[1] != 'E' || eh[2] != 'L' || eh[3] != 'F'
++	    || eh[4] != 1 || eh[5] != 1 || abi_exec_word(eh + 18, 2) != 3)
++		goto out;
++	phoff = abi_exec_word(eh + 28, 4);
++	phentsize = abi_exec_word(eh + 42, 2);
++	phnum = abi_exec_word(eh + 44, 2);
++	emulated = 1;
++	for (i = 0; i < phnum && phentsize >= sizeof(ph); i++) {
++		if (!abi_exec_reads(fd, phoff + i * phentsize, ph, sizeof(ph)))
++			break;
++		if (abi_exec_word(ph, 4) == 3) {	/* PT_INTERP */
++			u_long	n = abi_exec_word(ph + 16, 4);
++
++			if (n >= sizeof(interp))
++				n = sizeof(interp) - 1;
++			memset(interp, 0, sizeof(interp));
++			if (abi_exec_reads(fd, abi_exec_word(ph + 4, 4), interp, n)
++			    && strstr(interp, "ld-linux") != (char*)0)
++				emulated = 0;
++			break;
++		}
++	}
++out:
++	IBCS_SYSCALL(close, fd);
++	return emulated;
++}
++
++/*
++ * Start the file under this emulation; returns only on failure.  The file must
++ * be one exec(2) would start: the same check as the kernel's comes first, so
++ * that a file that may not be executed fails here and not in the new run.
++ */
++static int abi_exec_in_emulation(const char* path, const char* const* argv,
++				 const char* const* envp)
++{
++	const char*	head[16];
++	int		nhead, nargs = 0, k = 0, i, error;
++
++	error = (int)IBCS_SYSCALL(access, path, 1);		/* X_OK */
++	if (IBCS_IS_ERR(error))
++		return error;
++	while (argv != (const char* const*)0 && argv[nargs] != (const char*)0)
++		nargs++;
++	nhead = ibcs_exec_options(head, ARRAY_END(head) - head);
++	{
++		const char*	av[nhead + 3 + (nargs ? nargs : 1) + 1];
++
++		for (i = 0; i < nhead; i++)
++			av[k++] = head[i];
++		av[k++] = "-e";
++		av[k++] = path;
++		av[k++] = "--";
++		if (nargs == 0)
++			av[k++] = path;
++		for (i = 0; i < nargs; i++)
++			av[k++] = argv[i];
++		av[k] = (const char*)0;
++		return (int)IBCS_SYSCALL(execve, "/proc/self/exe", av, envp);
++	}
++}
++#endif
++
+ /*
+  * Trace arguments of exec().
+  *
+@@ -426,12 +547,25 @@
+ 	ocx = _CX(regs); _CX(regs) = argv;
+ 	odx = _DX(regs); _DX(regs) = envp;
+ #ifdef	_KSL_IBCS_US
++	if (pgm != 0) {
++		char	mapped[PATH_MAX];
++
++		filemap_map(mapped, sizeof(mapped), (const char*)pgm);
++		if (abi_exec_emulated(mapped)) {
++			error = abi_exec_in_emulation(mapped,
++				(const char* const*)argv, (const char* const*)envp);
++			goto failed;
++		}
++	}
+ 	error = SYS(execve,pgm,argv,envp,regs);
+ #elif	CONFIG_64BIT
+ 	error = SYS(execve,pgm,argv,envp,regs);
+ #else
+ 	error = SYS(execve,regs);
+ #endif
++#ifdef	_KSL_IBCS_US
++failed:
++#endif
+ 	if (error < 0) {
+ 		_BX(regs) = obx;
+ 		_CX(regs) = ocx;

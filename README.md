@@ -6,9 +6,10 @@ space: the program executes on the processor, and each call it makes through the
 is answered from Linux system calls. It is Russell Stuart's continuation of the kernel's
 iBCS module, under the GNU General Public License, version 2 (`LICENSE`).
 
-This repository is not a fork of its source. It holds the corrections a program needed
-(`patches/`), the recipe that builds the released source with them (`build.sh`), a probe
-that shows each correction (`tests/`), and the workflow that publishes the result. The
+This repository is not a fork of its source. It holds the corrections a program needed and
+one change of behaviour (`patches/`), the recipe that builds the released source with them
+(`build.sh`), a probe that shows each of them (`tests/`), and the workflow that publishes the
+result. The
 packages `ibcs-us` of the xlings index install what is published here.
 
 | | |
@@ -32,9 +33,8 @@ The interface a program is run under is read from its ELF header (`e_flags` zero
 UnixWare 7), or given: `-p per_uw7`, `-p per_solaris`, `-p per_osr5`. The source registers
 no interface of Release 4.0 itself.
 
-A program that replaces its image (`exec`) leaves the emulation: the call is handed to
-Linux, which starts the file as its own. That is the upstream's behaviour and is not
-changed here.
+A program that replaces its image (`exec`) with another program of the interface stays in
+the emulation (from 4.3-2, below); any other file is started by Linux, as the upstream does.
 
 ## The corrections
 
@@ -51,9 +51,24 @@ directory, shorten a file or change a file's mode. `patches/ibcs-us-4.3-correcti
 | `ibcs/linux26-compat.c` | `chmod` and `chown` entered as the `stat` and `access` handlers | `chmod` of any file answered EFAULT | the handler for a path |
 | `per-svr4/fcntl.c` | `F_FREESP` answered success and freed nothing | a shortened file kept its length | a truncation, for a range to the end of the file |
 
+## exec stays in the emulation (4.3-2)
+
+Upstream, `exec` is handed to Linux as it is, and Linux starts the file as its own program:
+outside the emulation, where the program's first call through the call gate faults. A
+program that starts another of its kind (a shell, a command interpreter, a test suite that
+starts itself) could not. `patches/ibcs-us-4.3-exec.patch` changes that:
+
+| File | Change |
+|---|---|
+| `per-svr4/misc.c` | `abi_exec` reads the file's header (after the file map, `-m`). An i386 COFF or x.out executable, or a 32-bit i386 ELF that does not name Linux's dynamic linker (`ld-linux`) as its interpreter, is started under the emulation again: `/proc/self/exe` with this run's options and the file named by `--exec`, the arguments unchanged. Any other file (a script, a program of another architecture, an i386 program of Linux's C library) is handed to Linux as before. The file must be executable (`access`), as `exec` requires, before the new run is started. |
+| `ibcs/main.c` | `-e F, --exec=F`: load the file F, and give the program the arguments that follow, its first included (the upstream takes the program's first argument as the file to load, which loses an `argv[0]` the caller chose). The options a run was given (`-p`, `-t`, `-l`, `-m`) are kept for the runs its programs start. |
+
+## The probe
+
 `tests/run.sh <ibcs-us>` builds a program with no C library that makes these calls and runs
 it under the three interfaces. Under the upstream's released binary it ends at the first
-correction; under this repository's it holds in every line.
+correction; under 4.3-1 every line holds but the one of `exec`; under this repository's it
+holds in every line.
 
 ## Building
 

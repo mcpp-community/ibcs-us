@@ -5,7 +5,7 @@ name: Build
 #   build   the upstream release (upstream/), held to its digest, builds with patches/ by build.sh on the
 #           runner's own GCC, with no i386 development package installed.
 #   probe   tests/run.sh: a program of the interface with no C library, under the three
-#           interfaces a static ELF is run as; each line is one of the corrections.
+#           interfaces a static ELF is run as; each line is one of the changes of patches/.
 #   release on a tag `<upstream>-<n>', the same steps' output is the release: the archive the
 #           xlings package installs, its digest, and the upstream source archive beside it.
 #           A release is not built by other steps than the ones that were tested.
